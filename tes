@@ -1,1 +1,37 @@
-ss
+#!/usr/bin/env bash
+# Usage: bash docker-export.sh > docker-export.json   (needs jq)
+set -euo pipefail
+
+# Every container, running or stopped, however it was started
+containers=$(docker inspect $(docker ps -aq) | jq '[.[] | {
+  name: (.Name|ltrimstr("/")), state: .State.Status, started_by_compose: (.Config.Labels["com.docker.compose.project"] != null),
+  image: .Config.Image, image_id: .Image,
+  entrypoint: .Config.Entrypoint, cmd: .Config.Cmd, user: .Config.User, workdir: .Config.WorkingDir,
+  env: .Config.Env,
+  exposed_ports: (.Config.ExposedPorts // {} | keys), published_ports: .HostConfig.PortBindings,
+  network_mode: .HostConfig.NetworkMode,
+  networks: (.NetworkSettings.Networks | with_entries(.value |= {aliases: .Aliases, ip: .IPAddress})),
+  mounts: [.Mounts[] | {type: .Type, name: .Name, source: .Source, target: .Destination, rw: .RW}],
+  healthcheck: .Config.Healthcheck, restart: .HostConfig.RestartPolicy.Name,
+  memory_bytes: .HostConfig.Memory, nano_cpus: .HostConfig.NanoCpus, shm_size: .HostConfig.ShmSize,
+  extra_hosts: .HostConfig.ExtraHosts, dns: .HostConfig.Dns, links: .HostConfig.Links,
+  privileged: .HostConfig.Privileged, cap_add: .HostConfig.CapAdd, devices: .HostConfig.Devices,
+  ulimits: .HostConfig.Ulimits, sysctls: .HostConfig.Sysctls, log_driver: .HostConfig.LogConfig,
+  labels: .Config.Labels }]')
+
+# Compose definitions, only for containers that came from compose (skipped if none or unreadable)
+compose=$(docker ps -a --filter label=com.docker.compose.project \
+            --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.config_files"}}|{{.Label "com.docker.compose.project.working_dir"}}' | sort -u |
+  while IFS='|' read -r name files dir; do
+    args=(); IFS=',' read -ra fs <<< "$files"; for f in "${fs[@]}"; do args+=(-f "$f"); done
+    (cd "$dir" 2>/dev/null && docker compose -p "$name" "${args[@]}" config --format json 2>/dev/null | jq --arg p "$name" '{($p): .}') \
+      || jq -n --arg p "$name" --arg f "$files" '{($p): ("compose files not readable: " + $f)}'
+  done | jq -s 'add // {}')
+
+networks=$(docker network inspect $(docker network ls -q) | jq '[.[] | select(.Name|IN("bridge","host","none")|not)
+  | {name: .Name, driver: .Driver, subnets: [.IPAM.Config[]?.Subnet], containers: [.Containers[]?.Name]}]')
+volumes=$(docker volume ls -q | xargs -r docker volume inspect | jq '[.[] | {name: .Name, driver: .Driver, mountpoint: .Mountpoint}]')
+
+jq -n --arg host "$(hostname)" --arg docker "$(docker version -f '{{.Server.Version}}')" \
+  --argjson c "$containers" --argjson p "$compose" --argjson n "$networks" --argjson v "$volumes" \
+  '{host: $host, docker: $docker, containers: $c, compose: $p, networks: $n, volumes: $v}'
